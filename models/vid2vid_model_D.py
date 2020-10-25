@@ -115,6 +115,8 @@ class Vid2VidModelD(BaseModel):
         real_B, fake_B, fake_B_raw, real_A, real_B_prev, fake_B_prev, flow, weight, flow_ref, conf_ref = tensors_list
         _, _, self.height, self.width = real_B.size()
 
+        print("inputs", [x.shape for x in tensors_list])
+
         ################### Flow loss #################
         if flow is not None:
             # similar to flownet flow        
@@ -181,7 +183,8 @@ class Vid2VidModelD(BaseModel):
     def compute_loss_D_T(self, real_B, fake_B, flow_ref, conf_ref, scale_T):         
         netD_T = getattr(self, 'netD_T'+str(scale_T))
         real_B = real_B.view(-1, self.output_nc * self.tD, self.height, self.width)
-        fake_B = fake_B.view(-1, self.output_nc * self.tD, self.height, self.width)        
+        fake_B = fake_B.view(-1, self.output_nc * self.tD, self.height, self.width)       
+        print("compute_loss_D_T", real_B.shape, fake_B.shape) 
         if flow_ref is not None:
             flow_ref = flow_ref.view(-1, 2 * (self.tD-1), self.height, self.width)                        
             real_B = torch.cat([real_B, flow_ref], dim=1)

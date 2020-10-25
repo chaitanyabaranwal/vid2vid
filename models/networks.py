@@ -114,6 +114,10 @@ class BaseNetwork(nn.Module):
         output = self.grid_sample(image, final_grid)
         return output
 
+##############################################################################
+# Generators
+##############################################################################
+
 class CompositeGenerator(BaseNetwork):
     def __init__(self, opt, input_nc, output_nc, prev_output_nc, ngf, n_downsampling, n_blocks, use_fg_model=False, no_flow=False,
                 norm_layer=nn.BatchNorm2d, padding_type='reflect'):
@@ -200,7 +204,16 @@ class CompositeGenerator(BaseNetwork):
             self.model_final_flow = nn.Sequential(*model_final_flow)                       
             self.model_final_w = nn.Sequential(*model_final_w)
 
+        # LSTM network
+        tG = self.opt.n_frames_G
+        lstm_network = [ConvLSTM(input_dim=input_nc // tG, hidden_dim=input_nc // tG, kernel_size=(3, 3), num_layers=tG)]
+        self.lstm_network = nn.Sequential(*lstm_network)
+
     def forward(self, input, img_prev, mask, img_feat_coarse, flow_feat_coarse, img_fg_feat_coarse, use_raw_only):
+        b, labels, h, w = input.size()
+        lstm = self.lstm_network(torch.reshape(input, (b, self.opt.n_frames_G, labels // self.opt.n_frames_G, h, w)))
+        
+        print(f'Composite Generator input: {input.shape}')
         downsample = self.model_down_seg(input) + self.model_down_img(img_prev)
         img_feat = self.model_up_img(self.model_res_img(downsample))
         img_raw = self.model_final_img(img_feat)
@@ -229,6 +242,7 @@ class CompositeGenerator(BaseNetwork):
             img_final = img_fg * mask + img_final * (1-mask) 
             img_raw = img_fg * mask + img_raw * (1-mask)                 
 
+        print(f'Composite Generator output: {img_final.shape}')
         return img_final, flow, weight, img_raw, img_feat, flow_feat, img_fg_feat
 
 class CompositeLocalGenerator(BaseNetwork):
@@ -550,6 +564,49 @@ class Local_with_z(nn.Module):
         output = self.model_final(torch.cat([output_prev, z], dim=1))
         return output 
 
+class Encoder(nn.Module):
+    def __init__(self, input_nc, output_nc, ngf=32, n_downsampling=4, norm_layer=nn.BatchNorm2d):
+        super(Encoder, self).__init__()        
+        self.output_nc = output_nc        
+
+        model = [nn.ReflectionPad2d(3), nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0), 
+                 norm_layer(ngf), nn.ReLU(True)]             
+        ### downsample
+        for i in range(n_downsampling):
+            mult = 2**i
+            model += [nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1),
+                      norm_layer(ngf * mult * 2), nn.ReLU(True)]
+
+        ### upsample         
+        for i in range(n_downsampling):
+            mult = 2**(n_downsampling - i)
+            model += [nn.ConvTranspose2d(ngf * mult, int(ngf * mult / 2), kernel_size=3, stride=2, padding=1, output_padding=1),
+                       norm_layer(int(ngf * mult / 2)), nn.ReLU(True)]        
+
+        model += [nn.ReflectionPad2d(3), nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0), nn.Tanh()]
+        self.model = nn.Sequential(*model) 
+
+    def forward(self, input, inst):
+        outputs = self.model(input)
+
+        # instance-wise average pooling
+        outputs_mean = outputs.clone()        
+        for b in range(input.size()[0]):            
+            inst_list = np.unique(inst[b].cpu().numpy().astype(int))            
+            for i in inst_list:            
+                indices = (inst[b:b+1] == int(i)).nonzero() # n x 4                
+                for j in range(self.output_nc):
+                    output_ins = outputs[indices[:,0] + b, indices[:,1] + j, indices[:,2], indices[:,3]]                    
+                    mean_feat = torch.mean(output_ins).expand_as(output_ins)                    
+                    ### add random noise to output feature
+                    #mean_feat += torch.normal(torch.zeros_like(mean_feat), 0.05 * torch.ones_like(mean_feat)).cuda()                    
+                    outputs_mean[indices[:,0] + b, indices[:,1] + j, indices[:,2], indices[:,3]] = mean_feat
+        return outputs_mean
+
+##############################################################################
+# Network components
+##############################################################################
+
 # Define a resnet block
 class ResnetBlock(nn.Module):
     def __init__(self, dim, padding_type, norm_layer, activation=nn.ReLU(True), use_dropout=False):
@@ -592,44 +649,143 @@ class ResnetBlock(nn.Module):
         out = x + self.conv_block(x)
         return out
 
-class Encoder(nn.Module):
-    def __init__(self, input_nc, output_nc, ngf=32, n_downsampling=4, norm_layer=nn.BatchNorm2d):
-        super(Encoder, self).__init__()        
-        self.output_nc = output_nc        
+# One cell for convolutional LSTM
+class ConvLSTMCell(nn.Module):
+    def __init__(self, input_dim, hidden_dim, kernel_size, bias, padding=None):
+        '''
+        Parameters:
 
-        model = [nn.ReflectionPad2d(3), nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0), 
-                 norm_layer(ngf), nn.ReLU(True)]             
-        ### downsample
-        for i in range(n_downsampling):
-            mult = 2**i
-            model += [nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1),
-                      norm_layer(ngf * mult * 2), nn.ReLU(True)]
+        input_dim: Number of channels in input tensor
+        hidden_dim: Number of channels in hidden state
+        kernel_size: Size of convolutional kernel
+        bias: Whether or not to add the bias
+        '''
 
-        ### upsample         
-        for i in range(n_downsampling):
-            mult = 2**(n_downsampling - i)
-            model += [nn.ConvTranspose2d(ngf * mult, int(ngf * mult / 2), kernel_size=3, stride=2, padding=1, output_padding=1),
-                       norm_layer(int(ngf * mult / 2)), nn.ReLU(True)]        
+        super(ConvLSTMCell, self).__init__()
 
-        model += [nn.ReflectionPad2d(3), nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0), nn.Tanh()]
-        self.model = nn.Sequential(*model) 
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
 
-    def forward(self, input, inst):
-        outputs = self.model(input)
+        self.conv = nn.Conv2d(
+            in_channels=self.input_dim + self.hidden_dim,
+            out_channels=4 * self.hidden_dim,
+            kernel_size=kernel_size,
+            padding=(kernel_size[0] // 2, kernel_size[1] // 2) if not padding else padding,
+            bias=bias
+        )
 
-        # instance-wise average pooling
-        outputs_mean = outputs.clone()        
-        for b in range(input.size()[0]):            
-            inst_list = np.unique(inst[b].cpu().numpy().astype(int))            
-            for i in inst_list:            
-                indices = (inst[b:b+1] == int(i)).nonzero() # n x 4                
-                for j in range(self.output_nc):
-                    output_ins = outputs[indices[:,0] + b, indices[:,1] + j, indices[:,2], indices[:,3]]                    
-                    mean_feat = torch.mean(output_ins).expand_as(output_ins)                    
-                    ### add random noise to output feature
-                    #mean_feat += torch.normal(torch.zeros_like(mean_feat), 0.05 * torch.ones_like(mean_feat)).cuda()                    
-                    outputs_mean[indices[:,0] + b, indices[:,1] + j, indices[:,2], indices[:,3]] = mean_feat
-        return outputs_mean
+    def forward(self, input_tensor, cur_state):
+        h_cur, c_cur = cur_state
+
+        # concatenate along channel axis
+        combined = torch.cat([input_tensor, h_cur], dim=1)
+        combined_conv = self.conv(combined)
+
+        # Perform operations specific to LSTM cell
+        cc_i, cc_f, cc_o, cc_g = torch.split(combined_conv, self.hidden_dim, dim=1)
+        i = torch.sigmoid(cc_i)
+        f = torch.sigmoid(cc_f)
+        o = torch.sigmoid(cc_o)
+        g = torch.tanh(cc_g)
+
+        # Calculate outputs for next cell
+        c_next = f * c_cur + i * g
+        h_next = o * torch.tanh(c_next)
+
+        return (h_next, c_next)
+
+    def init_hidden(self, batch_size, image_size):
+        height, width = image_size
+        return (
+            torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device),
+            torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv.weight.device)
+        )
+
+# Convolutional LSTM layer
+class ConvLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, kernel_size, num_layers, bias=True):
+        '''
+        Parameters:
+
+        input_dim: Number of channels in input
+        hidden_dim: Number of hidden channels
+        kernel_size: Size of kernel in convolutions
+        num_layers: Number of LSTM layers stacked on each other
+        batch_first: Whether or not dimension 0 is the batch or not
+        bias: Bias or no bias in Convolution
+        '''
+
+        super(ConvLSTM, self).__init__()
+
+        self._check_kernel_size_consistency(kernel_size)
+
+        # Make sure that both `kernel_size` and `hidden_dim` are lists having len == num_layers
+        kernel_size = self._extend_for_multilayer(kernel_size, num_layers)
+        hidden_dim = self._extend_for_multilayer(hidden_dim, num_layers)
+        if not len(kernel_size) == len(hidden_dim) == num_layers:
+            raise ValueError('Inconsistent list length.')
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.kernel_size = kernel_size
+        self.num_layers = num_layers
+        self.bias = bias
+
+        cell_list = []
+        for i in range(0, self.num_layers):
+            cur_input_dim = self.input_dim if i == 0 else self.hidden_dim[i - 1]
+
+            cell_list.append(ConvLSTMCell(input_dim=cur_input_dim,
+                                          hidden_dim=self.hidden_dim[i],
+                                          kernel_size=self.kernel_size[i],
+                                          bias=self.bias))
+
+        self.cell_list = nn.ModuleList(cell_list)
+
+    def forward(self, input_tensor):
+        '''
+        Parameters: 
+        input: 5-D tensor of shape (b, t, c, h, w)
+
+        Returns:
+        output: 5-D tensor of shape (b, 1, c, h, w)
+        '''
+
+        print(f'LSTM input shape: {input_tensor.shape}')
+
+        # Init first hidden state
+        b, _, _, h, w = input_tensor.size()
+        hidden_state = self.cell_list[0].init_hidden(batch_size=b, image_size=(h, w))
+
+        # Store outputs here
+        layer_output_list = []
+        last_state_list = []
+
+        # Run the LSTM network on the input
+        h, c = hidden_state
+        for layer_idx in range(self.num_layers):
+            h, c = self.cell_list[layer_idx](input_tensor=input_tensor[:, layer_idx, :, :, :], cur_state=[h, c])
+
+        # Return final output     
+        print(f'LSTM output shape: {h.shape}')       
+        return h
+
+    @staticmethod
+    def _check_kernel_size_consistency(kernel_size):
+        if not (isinstance(kernel_size, tuple) or
+                (isinstance(kernel_size, list) and all([isinstance(elem, tuple) for elem in kernel_size]))):
+            raise ValueError('`kernel_size` must be tuple or list of tuples')
+
+    @staticmethod
+    def _extend_for_multilayer(param, num_layers):
+        if not isinstance(param, list):
+            param = [param] * num_layers
+        return param
+
+
+##############################################################################
+# Discriminators
+##############################################################################
 
 class MultiscaleDiscriminator(nn.Module):
     def __init__(self, input_nc, ndf=64, n_layers=3, norm_layer=nn.BatchNorm2d, 
