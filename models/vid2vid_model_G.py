@@ -112,12 +112,10 @@ class Vid2VidModelG(BaseModel):
         return input_map, real_image, pool_map
 
     def forward(self, input_A, input_B, inst_A, fake_B_prev, dummy_bs=0):
-        print('Before encode:')
-        print(f'Input_A: {input_A.shape}')
-        print(f'Input_B: {input_B.shape}')
-        print(f'Inst_A: {inst_A.shape}')
-        if fake_B_prev is not None:
-            print(f'fake_B_prev: {fake_B_prev.shape}')
+        if self.opt.debug:
+            print(f'Before encode: input_A {input_A.shape} input_B {input_B.shape} inst_A {inst_A.shape}')
+            if fake_B_prev is not None:
+                print(f'fake_B_prev {fake_B_prev.shape}')
     
         tG = self.opt.n_frames_G           
         gpu_split_id = self.opt.n_gpus_gen + 1        
@@ -126,7 +124,8 @@ class Vid2VidModelG(BaseModel):
             if input_A.size(0) == 0: return self.return_dummy(input_A)
         real_A_all, real_B_all, _ = self.encode_input(input_A, input_B, inst_A)        
 
-        print("after encode", real_A_all.shape, real_B_all.shape) 
+        if self.opt.debug:
+            print(f'After encode: real_A_all {real_A_all.shape} real_B_all {real_B_all.shape}') 
 
         is_first_frame = fake_B_prev is None
         if is_first_frame: # at the beginning of a sequence; needs to generate the first frame
@@ -143,7 +142,8 @@ class Vid2VidModelG(BaseModel):
         fake_B_prev = [B[:, -tG+1:].detach() for B in fake_B]
         fake_B = [B[:, tG-1:] for B in fake_B]
 
-        print("result", fake_B, fake_B_raw, fake_B_prev) 
+        if self.opt.debug:
+            print(f"Result: fake_B {len(fake_B)} * {fake_B[0].shape} fake_B_raw {len(fake_B_raw)} * {fake_B_raw[0].shape} fake_B_prev {len(fake_B_prev)} * {fake_B_prev[0].shape}") 
 
         return fake_B[0], fake_B_raw, flow, weight, real_A_all[:,tG-1:], real_B_all[:,tG-2:], fake_B_prev
 
@@ -158,7 +158,8 @@ class Vid2VidModelG(BaseModel):
         real_A_pyr = self.build_pyr(real_A_all)        
         fake_Bs_raw, flows, weights = None, None, None            
 
-        print("generate", len(real_A_pyr), real_A_pyr[0].shape)
+        if self.opt.debug:
+            print(f"Generated input: real_A_pyr {len(real_A_pyr)} * {real_A_pyr[0].shape}")
 
         ### sequentially generate each frame
         for t in range(n_frames_load):
@@ -169,31 +170,34 @@ class Vid2VidModelG(BaseModel):
             # coarse-to-fine approach
             for s in range(n_scales):
                 si = n_scales-1-s
-                print("tG:", tG)
                 ### prepare inputs                
                 # 1. input labels
                 real_As = real_A_pyr[si]
                 _, _, _, h, w = real_As.size()                  
-                real_As_reshaped = real_As[:, t:t+tG,...].view(self.bs, -1, h, w).cuda(gpu_id)              
-                print("real_A", real_As.shape, real_As_reshaped.shape)
+                real_As_reshaped = real_As[:, t:t+tG,...].view(self.bs, -1, h, w).cuda(gpu_id)
+                if self.opt.debug:          
+                    print(f"real_As {real_As.shape} real_As_reshaped {real_As_reshaped.shape}")
                 # 2. previous fake_Bs                
                 fake_B_prevs = fake_B_pyr[si][:, t:t+tG-1,...].cuda(gpu_id)
                 if (t % self.n_frames_bp) == 0:
                     fake_B_prevs = fake_B_prevs.detach()
-                fake_B_prevs_reshaped = fake_B_prevs.view(self.bs, -1, h, w)     
-                print("real_B", fake_B_prevs.shape, fake_B_prevs_reshaped.shape)
+                fake_B_prevs_reshaped = fake_B_prevs.view(self.bs, -1, h, w)
+                if self.opt.debug:
+                    print(f"fake_B_prevs {fake_B_prevs.shape} fake_B_prevs_reshaped {fake_B_prevs_reshaped.shape}")
                 
                 # 3. mask for foreground and whether to use warped previous image
                 mask_F = self.compute_mask(real_As, t+tG-1) if self.opt.fg else None
                 use_raw_only = self.opt.no_first_img and is_first_frame 
-                print("mask_F", mask_F.shape)
+                if self.opt.debug:
+                    print(f"mask_F {mask_F.shape}")
 
                 ### network forward                                                
                 fake_B, flow, weight, fake_B_raw, fake_B_feat, flow_feat, fake_B_fg_feat \
                     = netG[s][net_id].forward(real_As_reshaped, fake_B_prevs_reshaped, mask_F, 
                                               fake_B_feat, flow_feat, fake_B_fg_feat, use_raw_only)
 
-                print("fake_B", fake_B.shape, flow.shape, fake_B_raw.shape, fake_B_feat.shape, flow_feat.shape, fake_B_fg_feat.shape)                    
+                if self.opt.debug:
+                    print(f"fake_B {fake_B.shape} flow {flow.shape} fake_B_raw {fake_B_raw.shape} fake_B_feat {fake_B_feat.shape} flow_feat {flow_feat.shape} fakae_B_fg_feat {fake_B_fg_feat.shape}")                    
                 # if only training the finest scale, leave the coarser levels untouched
                 if s != n_scales-1 and not finetune_all:
                     fake_B, fake_B_feat = fake_B.detach(), fake_B_feat.detach()

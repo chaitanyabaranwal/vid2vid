@@ -52,7 +52,7 @@ def define_G(input_nc, output_nc, prev_output_nc, ngf, which_model_netG, n_downs
     else:
         raise NotImplementedError('Generator model name [%s] is not recognized' % which_model_netG)
 
-    #print_network(netG)
+    # print_network(netG)
     if len(gpu_ids) > 0:
         netG.cuda(gpu_ids[0])
     netG.apply(weights_init)
@@ -60,8 +60,8 @@ def define_G(input_nc, output_nc, prev_output_nc, ngf, which_model_netG, n_downs
 
 def define_D(input_nc, ndf, n_layers_D, norm='instance', num_D=1, getIntermFeat=False, gpu_ids=[]):        
     norm_layer = get_norm_layer(norm_type=norm)   
-    netD = MultiscaleDiscriminator(input_nc, ndf, n_layers_D, norm_layer, num_D, getIntermFeat)   
-    #print_network(netD)
+    netD = MultiscaleDiscriminator(input_nc, ndf, n_layers_D, norm_layer, num_D, getIntermFeat)
+    # print_network(netD)
     if len(gpu_ids) > 0:    
         netD.cuda(gpu_ids[0])
     netD.apply(weights_init)
@@ -128,11 +128,13 @@ class CompositeGenerator(BaseNetwork):
         self.use_fg_model = use_fg_model
         self.no_flow = no_flow
         activation = nn.ReLU(True)
+
+        tG = self.opt.n_frames_G
         
         if use_fg_model:
             ### individial image generation
             ngf_indv = ngf // 2 if n_downsampling > 2 else ngf
-            indv_nc = input_nc
+            indv_nc = input_nc + (input_nc // tG)
             indv_down = [nn.ReflectionPad2d(3), nn.Conv2d(indv_nc, ngf_indv, kernel_size=7, padding=0), 
                          norm_layer(ngf_indv), activation]        
             for i in range(n_downsampling):
@@ -154,7 +156,7 @@ class CompositeGenerator(BaseNetwork):
 
         ### flow and image generation
         ### downsample        
-        model_down_seg = [nn.ReflectionPad2d(3), nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0), norm_layer(ngf), activation]
+        model_down_seg = [nn.ReflectionPad2d(3), nn.Conv2d(input_nc + (input_nc // tG), ngf, kernel_size=7, padding=0), norm_layer(ngf), activation]
         for i in range(n_downsampling):
             mult = 2**i
             model_down_seg += [nn.Conv2d(ngf * mult, ngf * mult * 2, kernel_size=3, stride=2, padding=1),
@@ -163,7 +165,7 @@ class CompositeGenerator(BaseNetwork):
         mult = 2**n_downsampling
         for i in range(n_blocks - n_blocks//2):
             model_down_seg += [ResnetBlock(ngf * mult, padding_type=padding_type, activation=activation, norm_layer=norm_layer)]
-        model_down_img = [nn.ReflectionPad2d(3), nn.Conv2d(prev_output_nc, ngf, kernel_size=7, padding=0), norm_layer(ngf), activation]
+        model_down_img = [nn.ReflectionPad2d(3), nn.Conv2d(prev_output_nc + (prev_output_nc // (tG-1)), ngf, kernel_size=7, padding=0), norm_layer(ngf), activation]
         model_down_img += copy.deepcopy(model_down_seg[4:])
     
         ### resnet blocks
@@ -204,17 +206,31 @@ class CompositeGenerator(BaseNetwork):
             self.model_final_flow = nn.Sequential(*model_final_flow)                       
             self.model_final_w = nn.Sequential(*model_final_w)
 
-        # LSTM network
-        tG = self.opt.n_frames_G
-        lstm_network = [ConvLSTM(input_dim=input_nc // tG, hidden_dim=input_nc // tG, kernel_size=(3, 3), num_layers=tG)]
-        self.lstm_network = nn.Sequential(*lstm_network)
+        # Add a convolutional LSTM layer for real frames and previously generated frames
+        # for adding extra temporal information
+        self.lstm_seg_network = nn.Sequential(*[ConvLSTM(input_dim=input_nc // tG, hidden_dim=input_nc // tG, kernel_size=(3, 3), num_layers=tG)])
+        self.lstm_img_network = nn.Sequential(*[ConvLSTM(input_dim=prev_output_nc // (tG - 1), hidden_dim=prev_output_nc // (tG - 1), kernel_size=(3, 3), num_layers=tG - 1)])
 
     def forward(self, input, img_prev, mask, img_feat_coarse, flow_feat_coarse, img_fg_feat_coarse, use_raw_only):
+        tG = self.opt.n_frames_G
+
+        if self.opt.debug:
+            print(f'Composite generator input: {input.shape} {img_prev.shape}')
+
+        # Take input and feed into LSTM
         b, labels, h, w = input.size()
-        lstm = self.lstm_network(torch.reshape(input, (b, self.opt.n_frames_G, labels // self.opt.n_frames_G, h, w)))
+        lstm_input_result = self.lstm_seg_network(torch.reshape(input, (b, tG, labels // tG, h, w)))
+
+        # Take previous images and feed into LSTM
+        b, images, h, w = img_prev.size()
+        lstm_img_prev_result = self.lstm_img_network(torch.reshape(img_prev, (b, tG - 1, images // (tG - 1), h, w)))
         
-        print(f'Composite Generator input: {input.shape}')
-        downsample = self.model_down_seg(input) + self.model_down_img(img_prev)
+        # Add LSTM result into real frames input
+        new_input = torch.cat((input, lstm_input_result), dim=1)
+        # Add LSTM result into prev frames input
+        new_img_prev = torch.cat((img_prev, lstm_img_prev_result), dim=1)
+
+        downsample = self.model_down_seg(new_input) + self.model_down_img(new_img_prev)
         img_feat = self.model_up_img(self.model_res_img(downsample))
         img_raw = self.model_final_img(img_feat)
 
@@ -235,14 +251,15 @@ class CompositeGenerator(BaseNetwork):
         
         img_fg_feat = None
         if self.use_fg_model:
-            img_fg_feat = self.indv_up(self.indv_res(self.indv_down(input)))
+            img_fg_feat = self.indv_up(self.indv_res(self.indv_down(new_input)))
             img_fg = self.indv_final(img_fg_feat)
 
             mask = mask.cuda(gpu_id).expand_as(img_raw)            
             img_final = img_fg * mask + img_final * (1-mask) 
             img_raw = img_fg * mask + img_raw * (1-mask)                 
 
-        print(f'Composite Generator output: {img_final.shape}')
+        if self.opt.debug:
+            print(f'Composite Generator output: {img_final.shape}')
         return img_final, flow, weight, img_raw, img_feat, flow_feat, img_fg_feat
 
 class CompositeLocalGenerator(BaseNetwork):
@@ -751,8 +768,6 @@ class ConvLSTM(nn.Module):
         output: 5-D tensor of shape (b, 1, c, h, w)
         '''
 
-        print(f'LSTM input shape: {input_tensor.shape}')
-
         # Init first hidden state
         b, _, _, h, w = input_tensor.size()
         hidden_state = self.cell_list[0].init_hidden(batch_size=b, image_size=(h, w))
@@ -766,8 +781,7 @@ class ConvLSTM(nn.Module):
         for layer_idx in range(self.num_layers):
             h, c = self.cell_list[layer_idx](input_tensor=input_tensor[:, layer_idx, :, :, :], cur_state=[h, c])
 
-        # Return final output     
-        print(f'LSTM output shape: {h.shape}')       
+        # Return final output    
         return h
 
     @staticmethod
