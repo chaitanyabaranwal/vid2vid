@@ -206,10 +206,10 @@ class CompositeGenerator(BaseNetwork):
             self.model_final_flow = nn.Sequential(*model_final_flow)                       
             self.model_final_w = nn.Sequential(*model_final_w)
 
-        # Add a convolutional LSTM layer for real frames and previously generated frames
+        # Add a convolutional RNN layer for real frames and previously generated frames
         # for adding extra temporal information
-        self.lstm_seg_network = nn.Sequential(*[ConvLSTM(input_dim=input_nc // tG, hidden_dim=input_nc // tG, kernel_size=(3, 3), num_layers=tG)])
-        self.lstm_img_network = nn.Sequential(*[ConvLSTM(input_dim=prev_output_nc // (tG - 1), hidden_dim=prev_output_nc // (tG - 1), kernel_size=(3, 3), num_layers=tG - 1)])
+        self.rnn_seg_network = nn.Sequential(*[ConvGRU(input_dim=input_nc // tG, hidden_dim=input_nc // tG, kernel_size=(3, 3), num_layers=tG)])
+        self.rnn_img_network = nn.Sequential(*[ConvGRU(input_dim=prev_output_nc // (tG - 1), hidden_dim=prev_output_nc // (tG - 1), kernel_size=(3, 3), num_layers=tG - 1)])
 
     def forward(self, input, img_prev, mask, img_feat_coarse, flow_feat_coarse, img_fg_feat_coarse, use_raw_only):
         tG = self.opt.n_frames_G
@@ -217,18 +217,18 @@ class CompositeGenerator(BaseNetwork):
         if self.opt.debug:
             print(f'Composite generator input: input {input.shape} img_prev {img_prev.shape}')
 
-        # Take input and feed into LSTM
+        # Take input and feed into RNN
         b, labels, h, w = input.size()
-        lstm_input_result = self.lstm_seg_network(torch.reshape(input, (b, tG, labels // tG, h, w)))
+        rnn_input_result = self.rnn_seg_network(torch.reshape(input, (b, tG, labels // tG, h, w)))
 
-        # Take previous images and feed into LSTM
+        # Take previous images and feed into RNN
         b, images, h, w = img_prev.size()
-        lstm_img_prev_result = self.lstm_img_network(torch.reshape(img_prev, (b, tG - 1, images // (tG - 1), h, w)))
+        rnn_img_prev_result = self.rnn_img_network(torch.reshape(img_prev, (b, tG - 1, images // (tG - 1), h, w)))
         
-        # Add LSTM result into real frames input
-        new_input = torch.cat((input, lstm_input_result), dim=1)
-        # Add LSTM result into prev frames input
-        new_img_prev = torch.cat((img_prev, lstm_img_prev_result), dim=1)
+        # Add RNN result into real frames input
+        new_input = torch.cat((input, rnn_input_result), dim=1)
+        # Add RNN result into prev frames input
+        new_img_prev = torch.cat((img_prev, rnn_img_prev_result), dim=1)
 
         downsample = self.model_down_seg(new_input) + self.model_down_img(new_img_prev)
         img_feat = self.model_up_img(self.model_res_img(downsample))
@@ -327,10 +327,10 @@ class CompositeLocalGenerator(BaseNetwork):
             self.model_final_flow = nn.Sequential(*model_final_flow)                     
             self.model_final_w = nn.Sequential(*model_final_w)
 
-        # Add a convolutional LSTM layer for real frames and previously generated frames
+        # Add a convolutional RNN layer for real frames and previously generated frames
         # for adding extra temporal information
-        self.lstm_seg_network = nn.Sequential(*[ConvLSTM(input_dim=input_nc // tG, hidden_dim=input_nc // tG, kernel_size=(3, 3), num_layers=tG)])
-        self.lstm_img_network = nn.Sequential(*[ConvLSTM(input_dim=prev_output_nc // (tG - 1), hidden_dim=prev_output_nc // (tG - 1), kernel_size=(3, 3), num_layers=tG - 1)])   
+        self.rnn_seg_network = nn.Sequential(*[ConvGRU(input_dim=input_nc // tG, hidden_dim=input_nc // tG, kernel_size=(3, 3), num_layers=tG)])
+        self.rnn_img_network = nn.Sequential(*[ConvGRU(input_dim=prev_output_nc // (tG - 1), hidden_dim=prev_output_nc // (tG - 1), kernel_size=(3, 3), num_layers=tG - 1)])
 
     def forward(self, input, img_prev, mask, img_feat_coarse, flow_feat_coarse, img_fg_feat_coarse, use_raw_only):
         tG = self.opt.n_frames_G
@@ -338,18 +338,18 @@ class CompositeLocalGenerator(BaseNetwork):
         if self.opt.debug:
             print(f'Composite local generator input: input {input.shape} img_prev {img_prev.shape}')
 
-        # Take input and feed into LSTM
+        # Take input and feed into RNN
         b, labels, h, w = input.size()
-        lstm_input_result = self.lstm_seg_network(torch.reshape(input, (b, tG, labels // tG, h, w)))
+        rnn_input_result = self.rnn_seg_network(torch.reshape(input, (b, tG, labels // tG, h, w)))
 
-        # Take previous images and feed into LSTM
+        # Take previous images and feed into RNN
         b, images, h, w = img_prev.size()
-        lstm_img_prev_result = self.lstm_img_network(torch.reshape(img_prev, (b, tG - 1, images // (tG - 1), h, w)))
+        rnn_img_prev_result = self.rnn_img_network(torch.reshape(img_prev, (b, tG - 1, images // (tG - 1), h, w)))
         
-        # Add LSTM result into real frames input
-        new_input = torch.cat((input, lstm_input_result), dim=1)
-        # Add LSTM result into prev frames input
-        new_img_prev = torch.cat((img_prev, lstm_img_prev_result), dim=1)
+        # Add RNN result into real frames input
+        new_input = torch.cat((input, rnn_input_result), dim=1)
+        # Add RNN result into prev frames input
+        new_img_prev = torch.cat((img_prev, rnn_img_prev_result), dim=1)
 
         flow_multiplier = 20 * (2 ** self.scale)        
         down_img = self.model_down_seg(new_input) + self.model_down_img(new_img_prev)
@@ -412,8 +412,8 @@ class GlobalGenerator(nn.Module):
         model += [nn.ReflectionPad2d(3), nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0), nn.Tanh()]        
         self.model = nn.Sequential(*model)
 
-        # Add a convolutional LSTM layer
-        self.lstm_model = nn.Sequential(*[ConvLSTM(input_dim=input_nc // tG, hidden_dim=input_nc // tG, kernel_size=(3, 3), num_layers=tG)])   
+        # Add a convolutional RNN layer
+        self.rnn_model = nn.Sequential(*[ConvGRU(input_dim=input_nc // tG, hidden_dim=input_nc // tG, kernel_size=(3, 3), num_layers=tG)])   
 
     def forward(self, input, feat=None):
         tG = self.opt.n_frames_G
@@ -421,16 +421,16 @@ class GlobalGenerator(nn.Module):
         if self.opt.debug:
             print(f'Global generator input: {input.shape}')
 
-        # Take input and feed into LSTM
+        # Take input and feed into RNN
         b, labels, h, w = input.size()
-        lstm_result = self.lstm_model(torch.reshape(input, (b, tG, labels // tG, h, w)))
+        rnn_result = self.rnn_model(torch.reshape(input, (b, tG, labels // tG, h, w)))
 
         if feat is not None:
-            input = torch.cat([input, lstm_result, feat], dim=1)
+            input = torch.cat([input, rnn_result, feat], dim=1)
         output = self.model(input)
 
         if self.opt.debug:
-            print(f'Global generator output: {output.shape}')   
+            print(f'Global generator output: {output.shape}')
         return output
 
 class LocalEnhancer(nn.Module):
@@ -793,13 +793,17 @@ class ConvLSTM(nn.Module):
         self.bias = bias
 
         cell_list = []
-        for i in range(0, self.num_layers):
+        for i in range(self.num_layers):
             cur_input_dim = self.input_dim if i == 0 else self.hidden_dim[i - 1]
 
-            cell_list.append(ConvLSTMCell(input_dim=cur_input_dim,
-                                          hidden_dim=self.hidden_dim[i],
-                                          kernel_size=self.kernel_size[i],
-                                          bias=self.bias))
+            cell_list.append(
+                ConvLSTMCell(
+                    input_dim=cur_input_dim,
+                    hidden_dim=self.hidden_dim[i],
+                    kernel_size=self.kernel_size[i],
+                    bias=self.bias
+                )
+            )
 
         self.cell_list = nn.ModuleList(cell_list)
 
@@ -815,10 +819,6 @@ class ConvLSTM(nn.Module):
         # Init first hidden state
         b, _, _, h, w = input_tensor.size()
         hidden_state = self.cell_list[0].init_hidden(batch_size=b, image_size=(h, w))
-
-        # Store outputs here
-        layer_output_list = []
-        last_state_list = []
 
         # Run the LSTM network on the input
         h, c = hidden_state
@@ -840,6 +840,139 @@ class ConvLSTM(nn.Module):
             param = [param] * num_layers
         return param
 
+# One cell for a convolutional GRU layer
+class ConvGRUCell(nn.Module):
+    def __init__(self, input_dim, hidden_dim, kernel_size, bias, padding=None):
+        '''
+        Parameters:
+
+        input_dim: Number of channels in input tensor
+        hidden_dim: Number of channels in hidden state
+        kernel_size: Size of convolutional kernel
+        bias: Whether or not to add the bias
+        '''
+
+        super(ConvGRUCell, self).__init__()
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.padding = (kernel_size[0] // 2, kernel_size[1] // 2) if not padding else padding
+
+        # For update and reset gate
+        self.conv_gates = nn.Conv2d(
+            in_channels=input_dim + hidden_dim,
+            out_channels=2 * self.hidden_dim,
+            kernel_size=kernel_size,
+            padding=self.padding,
+            bias=bias
+        )
+
+        # For candidate neural memory
+        self.conv_can = nn.Conv2d(
+            in_channels=input_dim + hidden_dim,
+            out_channels=hidden_dim,
+            kernel_size=kernel_size,
+            padding=self.padding,
+            bias=bias
+        )
+    
+    def forward(self, input_tensor, h_cur):
+        # concatenate along channel axis
+        combined = torch.cat([input_tensor, h_cur], dim=1)
+        combined_conv = self.conv_gates(combined)
+
+        # Perform operations specific to GRU cell
+        gamma, beta = torch.split(combined_conv, self.hidden_dim, dim=1)
+        reset_gate = torch.sigmoid(gamma)
+        update_gate = torch.sigmoid(beta)
+
+        combined = torch.cat([input_tensor, reset_gate * h_cur], dim=1)
+        cc_cnm = self.conv_can(combined)
+        cnm = torch.tanh(cc_cnm)
+
+        # Calculate outputs for next cell
+        h_next = (1 - update_gate) * h_cur + update_gate * cnm
+        return h_next
+
+    def init_hidden(self, batch_size, image_size):
+        height, width = image_size
+        return torch.zeros(batch_size, self.hidden_dim, height, width, device=self.conv_gates.weight.device)
+
+# Convolutional GRU layer
+class ConvGRU(nn.Module):
+    def __init__(self, input_dim, hidden_dim, kernel_size, num_layers, bias=True):
+        '''
+        Parameters:
+
+        input_dim: Number of channels in input
+        hidden_dim: Number of hidden channels
+        kernel_size: Size of kernel in convolutions
+        num_layers: Number of GRU layers stacked on each other
+        batch_first: Whether or not dimension 0 is the batch or not
+        bias: Bias or no bias in Convolution
+        '''
+
+        super(ConvGRU, self).__init__()
+
+        self._check_kernel_size_consistency(kernel_size)
+
+        # Make sure that both `kernel_size` and `hidden_dim` are lists having len == num_layers
+        kernel_size = self._extend_for_multilayer(kernel_size, num_layers)
+        hidden_dim = self._extend_for_multilayer(hidden_dim, num_layers)
+        if not len(kernel_size) == len(hidden_dim) == num_layers:
+            raise ValueError('Inconsistent list length.')
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.kernel_size = kernel_size
+        self.num_layers = num_layers
+        self.bias = bias
+
+        cell_list = []
+        for i in range(self.num_layers):
+            cur_input_dim = self.input_dim if i == 0 else self.hidden_dim[i - 1]
+            cell_list.append(
+                ConvGRUCell(
+                    input_dim=cur_input_dim,
+                    hidden_dim=self.hidden_dim[i],
+                    kernel_size=self.kernel_size[i],
+                    bias=self.bias
+                )
+            )
+        self.cell_list = nn.ModuleList(cell_list)
+
+    def forward(self, input_tensor):
+        '''
+        Parameters: 
+        input: 5-D tensor of shape (b, t, c, h, w)
+
+        Returns:
+        output: 5-D tensor of shape (b, 1, c, h, w)
+        '''
+
+        # Init first hidden state
+        b, _, _, h, w = input_tensor.size()
+        hidden_state = self.cell_list[0].init_hidden(batch_size=b, image_size=(h, w))
+
+        # Run the GRU network on the input
+        h = hidden_state
+        for layer_idx in range(self.num_layers):
+            h = self.cell_list[layer_idx](input_tensor=input_tensor[:, layer_idx, :, :, :], h_cur=h)
+
+        # Return final output
+        return h
+
+    @staticmethod
+    def _check_kernel_size_consistency(kernel_size):
+        if not (isinstance(kernel_size, tuple) or
+                (isinstance(kernel_size, list) and all([isinstance(elem, tuple) for elem in kernel_size]))):
+            raise ValueError('`kernel_size` must be tuple or list of tuples')
+
+    @staticmethod
+    def _extend_for_multilayer(param, num_layers):
+        if not isinstance(param, list):
+            param = [param] * num_layers
+        return param
 
 ##############################################################################
 # Discriminators
