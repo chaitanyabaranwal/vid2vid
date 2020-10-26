@@ -215,7 +215,7 @@ class CompositeGenerator(BaseNetwork):
         tG = self.opt.n_frames_G
 
         if self.opt.debug:
-            print(f'Composite generator input: {input.shape} {img_prev.shape}')
+            print(f'Composite generator input: input {input.shape} img_prev {img_prev.shape}')
 
         # Take input and feed into LSTM
         b, labels, h, w = input.size()
@@ -271,11 +271,14 @@ class CompositeLocalGenerator(BaseNetwork):
         self.no_flow = no_flow
         self.scale = scale    
         activation = nn.ReLU(True)
+
+        tG = opt.n_frames_G
         
         if use_fg_model:
-            ### individial image generation        
+            ### individial image generation      
+            indv_nc = input_nc + (input_nc // tG)
             ngf_indv = ngf // 2 if n_downsampling > 2 else ngf
-            indv_down = [nn.ReflectionPad2d(3), nn.Conv2d(input_nc, ngf_indv, kernel_size=7, padding=0), norm_layer(ngf_indv), activation,
+            indv_down = [nn.ReflectionPad2d(3), nn.Conv2d(indv_nc, ngf_indv, kernel_size=7, padding=0), norm_layer(ngf_indv), activation,
                          nn.Conv2d(ngf_indv, ngf_indv*2, kernel_size=3, stride=2, padding=1), norm_layer(ngf_indv*2), activation]        
 
             indv_up = []
@@ -289,9 +292,9 @@ class CompositeLocalGenerator(BaseNetwork):
 
         ### flow and image generation
         ### downsample
-        model_down_seg = [nn.ReflectionPad2d(3), nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0), norm_layer(ngf), activation,
+        model_down_seg = [nn.ReflectionPad2d(3), nn.Conv2d(input_nc + (input_nc // tG), ngf, kernel_size=7, padding=0), norm_layer(ngf), activation,
                           nn.Conv2d(ngf, ngf*2, kernel_size=3, stride=2, padding=1), norm_layer(ngf*2), activation]                  
-        model_down_img = [nn.ReflectionPad2d(3), nn.Conv2d(prev_output_nc, ngf, kernel_size=7, padding=0), norm_layer(ngf), activation,
+        model_down_img = [nn.ReflectionPad2d(3), nn.Conv2d(prev_output_nc + (prev_output_nc // (tG - 1)), ngf, kernel_size=7, padding=0), norm_layer(ngf), activation,
                           nn.Conv2d(ngf, ngf*2, kernel_size=3, stride=2, padding=1), norm_layer(ngf*2), activation]        
 
         ### resnet blocks
@@ -322,11 +325,34 @@ class CompositeLocalGenerator(BaseNetwork):
         if not no_flow:
             self.model_up_flow = nn.Sequential(*model_up_flow)                
             self.model_final_flow = nn.Sequential(*model_final_flow)                     
-            self.model_final_w = nn.Sequential(*model_final_w)        
+            self.model_final_w = nn.Sequential(*model_final_w)
+
+        # Add a convolutional LSTM layer for real frames and previously generated frames
+        # for adding extra temporal information
+        self.lstm_seg_network = nn.Sequential(*[ConvLSTM(input_dim=input_nc // tG, hidden_dim=input_nc // tG, kernel_size=(3, 3), num_layers=tG)])
+        self.lstm_img_network = nn.Sequential(*[ConvLSTM(input_dim=prev_output_nc // (tG - 1), hidden_dim=prev_output_nc // (tG - 1), kernel_size=(3, 3), num_layers=tG - 1)])   
 
     def forward(self, input, img_prev, mask, img_feat_coarse, flow_feat_coarse, img_fg_feat_coarse, use_raw_only):
+        tG = self.opt.n_frames_G
+
+        if self.opt.debug:
+            print(f'Composite local generator input: input {input.shape} img_prev {img_prev.shape}')
+
+        # Take input and feed into LSTM
+        b, labels, h, w = input.size()
+        lstm_input_result = self.lstm_seg_network(torch.reshape(input, (b, tG, labels // tG, h, w)))
+
+        # Take previous images and feed into LSTM
+        b, images, h, w = img_prev.size()
+        lstm_img_prev_result = self.lstm_img_network(torch.reshape(img_prev, (b, tG - 1, images // (tG - 1), h, w)))
+        
+        # Add LSTM result into real frames input
+        new_input = torch.cat((input, lstm_input_result), dim=1)
+        # Add LSTM result into prev frames input
+        new_img_prev = torch.cat((img_prev, lstm_img_prev_result), dim=1)
+
         flow_multiplier = 20 * (2 ** self.scale)        
-        down_img = self.model_down_seg(input) + self.model_down_img(img_prev)
+        down_img = self.model_down_seg(new_input) + self.model_down_img(new_img_prev)
         img_feat = self.model_up_img(down_img + img_feat_coarse)        
         img_raw = self.model_final_img(img_feat)
 
@@ -340,19 +366,21 @@ class CompositeLocalGenerator(BaseNetwork):
         gpu_id = img_feat.get_device()
         if use_raw_only or self.no_flow:
             img_final = img_raw
-        else:                                    
+        else:               
             img_warp = self.resample(img_prev[:,-3:,...].cuda(gpu_id), flow).cuda(gpu_id)
             weight_ = weight.expand_as(img_raw)
             img_final = img_raw * weight_ + img_warp * (1-weight_)
 
         img_fg_feat = None
         if self.use_fg_model:
-            img_fg_feat = self.indv_up(self.indv_down(input) + img_fg_feat_coarse)        
+            img_fg_feat = self.indv_up(self.indv_down(new_input) + img_fg_feat_coarse)        
             img_fg = self.indv_final(img_fg_feat)
             mask = mask.cuda(gpu_id).expand_as(img_raw)
             img_final = img_fg * mask + img_final * (1-mask)
             img_raw = img_fg * mask + img_raw * (1-mask)         
 
+        if self.opt.debug:
+            print(f'Composite local generator output: {img_final.shape}')
         return img_final, flow, weight, img_raw, img_feat, flow_feat, img_fg_feat
 
 class GlobalGenerator(nn.Module):
@@ -362,8 +390,9 @@ class GlobalGenerator(nn.Module):
         super(GlobalGenerator, self).__init__()
         activation = nn.ReLU(True)
         ch_max = 1024        
-        
-        model = [nn.ReflectionPad2d(3), nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0), norm_layer(ngf), activation]
+        tG = self.opt.n_frames_G
+
+        model = [nn.ReflectionPad2d(3), nn.Conv2d(input_nc + (input_nc // tG), ngf, kernel_size=7, padding=0), norm_layer(ngf), activation]
         for i in range(n_downsampling):
             mult = 2**i
             model += [nn.Conv2d(min(ch_max, ngf * mult), min(ch_max, ngf * mult * 2), kernel_size=3, stride=2, padding=1),
@@ -381,12 +410,27 @@ class GlobalGenerator(nn.Module):
                          kernel_size=3, stride=2, padding=1, output_padding=1),
                          norm_layer(min(ch_max, int(ngf * mult / 2))), activation]
         model += [nn.ReflectionPad2d(3), nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0), nn.Tanh()]        
-        self.model = nn.Sequential(*model)        
+        self.model = nn.Sequential(*model)
+
+        # Add a convolutional LSTM layer
+        self.lstm_model = nn.Sequential(*[ConvLSTM(input_dim=input_nc // tG, hidden_dim=input_nc // tG, kernel_size=(3, 3), num_layers=tG)])   
 
     def forward(self, input, feat=None):
+        tG = self.opt.n_frames_G
+
+        if self.opt.debug:
+            print(f'Global generator input: {input.shape}')
+
+        # Take input and feed into LSTM
+        b, labels, h, w = input.size()
+        lstm_result = self.lstm_model(torch.reshape(input, (b, tG, labels // tG, h, w)))
+
         if feat is not None:
-            input = torch.cat([input, feat], dim=1)
-        output = self.model(input)                
+            input = torch.cat([input, lstm_result, feat], dim=1)
+        output = self.model(input)
+
+        if self.opt.debug:
+            print(f'Global generator output: {output.shape}')   
         return output
 
 class LocalEnhancer(nn.Module):
