@@ -3,6 +3,7 @@
 import time
 import os
 import torch
+import torch.nn as nn
 from subprocess import call
 
 from options.train_options import TrainOptions
@@ -33,6 +34,8 @@ def train():
         start_epoch, epoch_iter, print_freq, total_steps, iter_path = init_params(opt, modelG, modelD, data_loader)
     visualizer = Visualizer(opt)    
 
+    additional_loss = nn.MSELoss()
+
     ### real training starts here  
     for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
         epoch_start_time = time.time()    
@@ -53,7 +56,9 @@ def train():
                 ###################################### Forward Pass ##########################
                 ####### generator                  
                 fake_B, fake_B_raw, flow, weight, real_A, real_Bp, fake_B_last = modelG(input_A, input_B, inst_A, fake_B_prev_last)
-
+                #print(input_A.shape, input_B.shape, fake_B.shape, real_A.shape)
+                image_loss = additional_loss(fake_B[:, 1:, :, :, :], fake_B[:, :-1, :, :, :])
+                #print(image_loss.item())
                 ####### discriminator            
                 ### individual frame discriminator          
                 real_B_prev, real_B = real_Bp[:, :-1], real_Bp[:, 1:]   # the collection of previous and current real frames
@@ -80,10 +85,10 @@ def train():
 
                 # collect losses
                 loss_G, loss_D, loss_D_T, t_scales_act = modelD.module.get_losses(loss_dict, loss_dict_T, t_scales)
-
+                #print(loss_G.item())
                 ###################################### Backward Pass #################################                 
                 # update generator weights     
-                loss_backward(opt, loss_G, optimizer_G)                
+                loss_backward(opt, loss_G + 0.00001 * image_loss, optimizer_G)                
 
                 # update individual discriminator weights                
                 loss_backward(opt, loss_D, optimizer_D)
