@@ -34,7 +34,7 @@ def define_G(input_nc, output_nc, prev_output_nc, ngf, which_model_netG, n_downs
     norm_layer = get_norm_layer(norm_type=norm)
 
     if which_model_netG == 'global':        
-        netG = GlobalGenerator(input_nc, output_nc, ngf, n_downsampling, opt.n_blocks, norm_layer)            
+        netG = GlobalGenerator(opt, input_nc, output_nc, ngf, n_downsampling, opt.n_blocks, norm_layer)            
     elif which_model_netG == 'local':        
         netG = LocalEnhancer(input_nc, output_nc, ngf, n_downsampling, opt.n_blocks, opt.n_local_enhancers, opt.n_blocks_local, norm_layer)
     elif which_model_netG == 'global_with_features':    
@@ -384,12 +384,13 @@ class CompositeLocalGenerator(BaseNetwork):
         return img_final, flow, weight, img_raw, img_feat, flow_feat, img_fg_feat
 
 class GlobalGenerator(nn.Module):
-    def __init__(self, input_nc, output_nc, ngf=64, n_downsampling=3, n_blocks=9, norm_layer=nn.BatchNorm2d, 
+    def __init__(self, opt, input_nc, output_nc, ngf=64, n_downsampling=3, n_blocks=9, norm_layer=nn.BatchNorm2d, 
                  padding_type='reflect'):
         assert(n_blocks >= 0)
         super(GlobalGenerator, self).__init__()
         activation = nn.ReLU(True)
         ch_max = 1024        
+        self.opt = opt
         tG = self.opt.n_frames_G
 
         model = [nn.ReflectionPad2d(3), nn.Conv2d(input_nc + (input_nc // tG), ngf, kernel_size=7, padding=0), norm_layer(ngf), activation]
