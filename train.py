@@ -2,7 +2,6 @@
 ### Licensed under the CC BY-NC-SA 4.0 license (https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode).
 import time
 import os
-import torch
 import torch.nn as nn
 from subprocess import call
 
@@ -11,6 +10,43 @@ from data.data_loader import CreateDataLoader
 from models.models import create_model, create_optimizer, init_params, save_models, update_models
 import util.util as util
 from util.visualizer import Visualizer
+import torch
+import torchvision
+
+class VGGPerceptualLoss(torch.nn.Module):
+    def __init__(self, resize=True):
+        super(VGGPerceptualLoss, self).__init__()
+        blocks = []
+        blocks.append(torchvision.models.vgg16(pretrained=True).features[:4].eval())
+        blocks.append(torchvision.models.vgg16(pretrained=True).features[4:9].eval())
+        blocks.append(torchvision.models.vgg16(pretrained=True).features[9:16].eval())
+        blocks.append(torchvision.models.vgg16(pretrained=True).features[16:23].eval())
+        for bl in blocks:
+            for p in bl:
+                p.requires_grad = False
+        self.blocks = torch.nn.ModuleList(blocks)
+        self.transform = torch.nn.functional.interpolate
+        self.mean = torch.nn.Parameter(torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1))
+        self.std = torch.nn.Parameter(torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1))
+        self.resize = resize
+
+    def forward(self, input, target):
+        if input.shape[1] != 3:
+            input = input.repeat(1, 3, 1, 1)
+            target = target.repeat(1, 3, 1, 1)
+        input = (input-self.mean) / self.std
+        target = (target-self.mean) / self.std
+        if self.resize:
+            input = self.transform(input, mode='bilinear', size=(224, 224), align_corners=False)
+            target = self.transform(target, mode='bilinear', size=(224, 224), align_corners=False)
+        loss = 0.0
+        x = input
+        y = target
+        for block in self.blocks:
+            x = block(x)
+            y = block(y)
+            loss += torch.nn.functional.l1_loss(x, y)
+        return loss
 
 def train():
     opt = TrainOptions().parse()
@@ -35,6 +71,7 @@ def train():
     visualizer = Visualizer(opt)    
 
     additional_loss = nn.MSELoss()
+    perceptive_loss = VGGPerceptualLoss().cuda()
 
     ### real training starts here  
     for epoch in range(start_epoch, opt.niter + opt.niter_decay + 1):
@@ -58,6 +95,7 @@ def train():
                 fake_B, fake_B_raw, flow, weight, real_A, real_Bp, fake_B_last = modelG(input_A, input_B, inst_A, fake_B_prev_last)
                 #print(input_A.shape, input_B.shape, fake_B.shape, real_A.shape)
                 image_loss = additional_loss(fake_B[:, 1:, :, :, :], fake_B[:, :-1, :, :, :])
+                #image_loss = perceptive_loss(fake_B[:, 1:, :, :, :][0], fake_B[:, :-1, :, :, :][0])
                 #print(image_loss.item())
                 ####### discriminator            
                 ### individual frame discriminator          
@@ -85,10 +123,10 @@ def train():
 
                 # collect losses
                 loss_G, loss_D, loss_D_T, t_scales_act = modelD.module.get_losses(loss_dict, loss_dict_T, t_scales)
-                #print(loss_G.item())
+                #print("G loss",loss_G.item())
                 ###################################### Backward Pass #################################                 
                 # update generator weights     
-                loss_backward(opt, loss_G + 0.00001 * image_loss, optimizer_G)                
+                loss_backward(opt, loss_G + 100 * image_loss, optimizer_G)                
 
                 # update individual discriminator weights                
                 loss_backward(opt, loss_D, optimizer_D)
